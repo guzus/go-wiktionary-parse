@@ -3,11 +3,10 @@ package main
 import (
 	"bytes"
 	"database/sql"
-	"encoding/gob"
-	"encoding/xml"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"go-wikitionary-parse/lib"
+	"go-wikitionary-parse/lib/wikitemplates"
 	"os"
 	"regexp"
 	"strings"
@@ -16,7 +15,7 @@ import (
 
 	"github.com/macdub/go-colorlog"
 	_ "github.com/mattn/go-sqlite3"
-	"go-wikitionary-parse/lib/wikitemplates"
+	_ "go-wikitionary-parse/lib"
 )
 
 var (
@@ -27,7 +26,7 @@ var (
 	wikiEtymologyS *regexp.Regexp = regexp.MustCompile(`(\s===|^===)Etymology===`)     // check for singular etymology
 	wikiEtymologyM *regexp.Regexp = regexp.MustCompile(`(\s===|^===)Etymology \d+===`) // these heading may or may not have a number designation
 	wikiNumListAny *regexp.Regexp = regexp.MustCompile(`\s##?[\*:]*? `)                // used to find all num list indices
-	wikiNumList    *regexp.Regexp = regexp.MustCompile(`\s#[^:\*] `)                   // used to find the num list entries that are of concern
+	wikiNumList    *regexp.Regexp = regexp.MustCompile(`\s#[^:*] `)                    // used to find the num list entries that are of concern
 	wikiGenHeading *regexp.Regexp = regexp.MustCompile(`(\s=+|^=+)[\w\s]+`)            // generic heading search
 	wikiNewLine    *regexp.Regexp = regexp.MustCompile(`\n`)
 	wikiBracket    *regexp.Regexp = regexp.MustCompile(`[\[\]]+`)
@@ -47,33 +46,6 @@ var (
 		"Pronoun", "Determiner", "Interjection", "Morpheme",
 		"Numeral", "Preposition", "Postposition"}
 )
-
-type WikiData struct {
-	XMLName xml.Name `xml:"mediawiki"`
-	Pages   []Page   `xml:"page"`
-}
-
-type Page struct {
-	XMLName   xml.Name   `xml:"page"`
-	Title     string     `xml:"title"`
-	Id        int        `xml:"id"`
-	Revisions []Revision `xml:"revision"`
-}
-
-type Revision struct {
-	Id      int    `xml:"id"`
-	Comment string `xml:"comment"`
-	Model   string `xml:"model"`
-	Format  string `xml:"format"`
-	Text    string `xml:"text"`
-	Sha1    string `xml:"sha1"`
-}
-
-type Insert struct {
-	Word      string
-	Etymology int
-	CatDefs   map[string][]string
-}
 
 func main() {
 	iFile := flag.String("file", "", "XML file to parse")
@@ -115,29 +87,29 @@ func main() {
 
 	logger.Debug("NOTE: input language should be provided as a proper noun. (e.g. English, French, West Frisian, etc.)\n")
 
-	data := &WikiData{}
+	data := &lib.WikiData{}
 	if *useCache {
-		d, err := decodeCache(*cacheFile)
+		d, err := lib.DecodeCache(*cacheFile)
 		data = d
-		check(err)
+		lib.Check(err)
 	} else if *iFile == "" {
 		logger.Error("Input file is empty. Exiting\n")
 		os.Exit(1)
 	} else {
 		logger.Info("Parsing XML file\n")
-		d := parseXML(*makeCache, *iFile, *cacheFile)
+		d := lib.ParseXML(*makeCache, *iFile, *cacheFile)
 		data = d
 	}
 
 	if *purge {
 		err := os.Remove(*db)
-		check(err)
+		lib.Check(err)
 	}
 
 	logger.Debug("Number of Pages: %d\n", len(data.Pages))
 	logger.Info("Opening database\n")
 	dbh, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?cache=shared&mode=rwc&_mutex=full&_busy_timeout=500", *db))
-	check(err)
+	lib.Check(err)
 	dbh.SetMaxOpenConns(1)
 
 	sth, err := dbh.Prepare(`CREATE TABLE IF NOT EXISTS dictionary
@@ -149,20 +121,20 @@ func main() {
                                  definition_no INTEGER,
                                  definition TEXT
                              )`)
-	check(err)
+	lib.Check(err)
 	sth.Exec()
 
 	sth, err = dbh.Prepare(`CREATE INDEX IF NOT EXISTS dict_word_idx
                             ON dictionary (word, lexical_category, etymology_no, definition_no)`)
 
-	check(err)
+	lib.Check(err)
 	sth.Exec()
 
-	filterPages(data)
+	lib.FilterPages(data, language)
 	logger.Info("Post filter page count: %d\n", len(data.Pages))
 
 	// split the work into 5 chunks
-	var chunks [][]Page
+	var chunks [][]lib.Page
 	size := len(data.Pages) / *threads
 	logger.Debug("Chunk size: %d\n", size)
 	logger.Debug(" >> %d\n", len(data.Pages)/size)
@@ -190,9 +162,9 @@ func main() {
 	logger.Info("Completed in %s\n", end_time.Sub(start_time))
 }
 
-func pageWorker(id int, wg *sync.WaitGroup, pages []Page, dbh *sql.DB) {
+func pageWorker(id int, wg *sync.WaitGroup, pages []lib.Page, dbh *sql.DB) {
 	defer wg.Done()
-	inserts := []*Insert{} // etymology : lexical category : [definitions...]
+	inserts := []*lib.Insert{} // etymology : lexical category : [definitions...]
 	for _, page := range pages {
 		word := page.Title
 		logger.Debug("Processing page: %s\n", word)
@@ -249,54 +221,20 @@ func pageWorker(id int, wg *sync.WaitGroup, pages []Page, dbh *sql.DB) {
 	}
 
 	// perform inserts
-	inserted := performInserts(dbh, inserts)
+	inserted := lib.PerformInserts(dbh, inserts)
 	logger.Info("[%2d] Inserted %6d records for %6d pages\n", id, inserted, len(pages))
 }
 
-func performInserts(dbh *sql.DB, inserts []*Insert) int {
-	ins_count := 0
-	query := `INSERT INTO dictionary (word, lexical_category, etymology_no, definition_no, definition)
-              VALUES (?, ?, ?, ?, ?)`
-
-	logger.Debug("performInserts> Preparing insert query...\n")
-	tx, err := dbh.Begin()
-	check(err)
-	defer tx.Rollback()
-
-	sth, err := tx.Prepare(query)
-	check(err)
-	defer sth.Close()
-
-	for _, ins := range inserts {
-		logger.Debug("performInserts> et_no=>'%d' defs=>'%+v'\n", ins.Etymology, ins.CatDefs)
-		for key, val := range ins.CatDefs {
-			category := key
-			for def_no, def := range val {
-				logger.Debug("performInserts> Inserting values: word=>'%s', lexical category=>'%s', et_no=>'%d', def_no=>'%d', def=>'%s'\n",
-					ins.Word, category, ins.Etymology, def_no, def)
-				_, err := sth.Exec(ins.Word, category, ins.Etymology, def_no, def)
-				check(err)
-				ins_count++
-			}
-		}
-	}
-
-	err = tx.Commit()
-	check(err)
-
-	return ins_count
-}
-
-func parseByEtymologies(word string, et_list [][]int, text []byte) []*Insert {
-	inserts := []*Insert{}
+func parseByEtymologies(word string, et_list [][]int, text []byte) []*lib.Insert {
+	inserts := []*lib.Insert{}
 	et_size := len(et_list)
 	for i := 0; i < et_size; i++ {
-		ins := &Insert{Word: word, Etymology: i, CatDefs: make(map[string][]string)}
+		ins := &lib.Insert{Word: word, Etymology: i, CatDefs: make(map[string][]string)}
 		section := []byte{}
 		if i+1 >= et_size {
-			section = getSection(et_list[i][1], -1, text)
+			section = lib.GetSection(et_list[i][1], -1, text)
 		} else {
-			section = getSection(et_list[i][1], et_list[i+1][0], text)
+			section = lib.GetSection(et_list[i][1], et_list[i+1][0], text)
 		}
 
 		logger.Debug("parseByEtymologies> Section is %d bytes\n", len(section))
@@ -306,11 +244,11 @@ func parseByEtymologies(word string, et_list [][]int, text []byte) []*Insert {
 
 		definitions := []string{}
 		for j := 0; j < lexcat_idx_size; j++ {
-			jth_idx := adjustIndexLW(lexcat_idx[j][0], section)
+			jth_idx := lib.AdjustIndexLW(lexcat_idx[j][0], section)
 			lexcat := string(section[jth_idx+4 : lexcat_idx[j][1]-4])
 			logger.Debug("parseByEtymologies> [%2d] lexcat: %s\n", j, lexcat)
 
-			if !stringInSlice(lexcat, lexicalCategory) {
+			if !lib.StringInSlice(lexcat, lexicalCategory) {
 				logger.Debug("parseByLemmas> Lexical category '%s' not in list. Skipping...\n", lexcat)
 				continue
 			}
@@ -324,7 +262,7 @@ func parseByEtymologies(word string, et_list [][]int, text []byte) []*Insert {
 			} else if j+1 >= lexcat_idx_size {
 				definitions = getDefinitions(lexcat_idx[j][1], -1, section)
 			} else {
-				jth_1_idx := adjustIndexLW(lexcat_idx[j+1][0], section)
+				jth_1_idx := lib.AdjustIndexLW(lexcat_idx[j+1][0], section)
 				definitions = getDefinitions(lexcat_idx[j][1], jth_1_idx, section)
 			}
 			logger.Debug("parseByEtymologies> Definitions: " + strings.Join(definitions, ", ") + "\n")
@@ -336,20 +274,20 @@ func parseByEtymologies(word string, et_list [][]int, text []byte) []*Insert {
 	return inserts
 }
 
-//parseByLemmas
-func parseByLexicalCategory(word string, lex_list [][]int, text []byte) []*Insert {
-	inserts := []*Insert{}
+// parseByLemmas
+func parseByLexicalCategory(word string, lex_list [][]int, text []byte) []*lib.Insert {
+	var inserts []*lib.Insert
 	lex_size := len(lex_list)
 	logger.Debug("parseByLexicalCategory> Found %d lexcats\n", lex_size)
 
 	for i := 0; i < lex_size; i++ {
-		ins := &Insert{Word: word, Etymology: 0, CatDefs: make(map[string][]string)}
-		ith_idx := adjustIndexLW(lex_list[i][0], text)
+		ins := &lib.Insert{Word: word, Etymology: 0, CatDefs: make(map[string][]string)}
+		ith_idx := lib.AdjustIndexLW(lex_list[i][0], text)
 		lexcat := string(text[ith_idx+3 : lex_list[i][1]-3])
 
 		logger.Debug("parseByLexicalCategory> [%2d] working on lexcat '%s'\n", i, lexcat)
 
-		if !stringInSlice(lexcat, lexicalCategory) {
+		if !lib.StringInSlice(lexcat, lexicalCategory) {
 			logger.Debug("parseByLexicalCategory> Lemma '%s' not in list. Skipping...\n", lexcat)
 			continue
 		}
@@ -358,7 +296,7 @@ func parseByLexicalCategory(word string, lex_list [][]int, text []byte) []*Inser
 		if i+1 >= lex_size {
 			definitions = getDefinitions(lex_list[i][1], -1, text)
 		} else {
-			ith_1_idx := adjustIndexLW(lex_list[i+1][0], text)
+			ith_1_idx := lib.AdjustIndexLW(lex_list[i+1][0], text)
 			logger.Debug("parseByLexicalCategory> LEMMA: %s\n", string(text[lex_list[i][1]:ith_1_idx]))
 			definitions = getDefinitions(lex_list[i][1], ith_1_idx, text)
 		}
@@ -370,6 +308,10 @@ func parseByLexicalCategory(word string, lex_list [][]int, text []byte) []*Inser
 	}
 
 	return inserts
+}
+
+func getTranslations(start int, end int, text []byte) []string {
+	return []string{}
 }
 
 func getDefinitions(start int, end int, text []byte) []string {
@@ -394,7 +336,7 @@ func getDefinitions(start int, end int, text []byte) []string {
 	logger.Debug("getDefinitions> Found %d NumList entries\n", len(nl_indices))
 	nl_indices_size := len(nl_indices)
 	for i := 0; i < nl_indices_size; i++ {
-		ith_idx := adjustIndexLW(nl_indices[i][0], category)
+		ith_idx := lib.AdjustIndexLW(nl_indices[i][0], category)
 		if string(category[ith_idx:nl_indices[i][1]]) != "# " {
 			logger.Debug("getDefinitions> Got quotation or annotation bullet. Skipping...\n")
 			continue
@@ -407,7 +349,7 @@ func getDefinitions(start int, end int, text []byte) []string {
 		}
 
 		if i+1 < nl_indices_size && string(category[ith_idx:nl_indices[i][1]]) == "# " {
-			ith_1_idx := adjustIndexLW(nl_indices[i+1][0], category)
+			ith_1_idx := lib.AdjustIndexLW(nl_indices[i+1][0], category)
 			def := parseDefinition(nl_indices[i][1], ith_1_idx, category)
 			logger.Debug("getDefinitions> [%0d] Appending %s to the definition list\n", i, string(def))
 			defs = append(defs, string(def))
@@ -424,7 +366,7 @@ func parseDefinition(start int, end int, text []byte) []byte {
 
 	// need to parse the templates in the definition
 	sDef, err := wikitemplates.ParseRecursive(def)
-	check(err)
+	lib.Check(err)
 
 	def = []byte(sDef)
 	newline := wikiNewLine.FindIndex(def)
@@ -488,127 +430,4 @@ func getLanguageSection(text []byte) []byte {
 	}
 
 	return corpus
-}
-
-// filter out the pages that are not words in the desired language
-func filterPages(wikidata *WikiData) {
-	engCheck := regexp.MustCompile(fmt.Sprintf(`==%s==`, language))
-	spaceCheck := regexp.MustCompile(`[:0-9]`)
-	skipCount := 0
-	i := 0
-	for i < len(wikidata.Pages) {
-		if !engCheck.MatchString(wikidata.Pages[i].Revisions[0].Text) || spaceCheck.MatchString(wikidata.Pages[i].Title) {
-			// remove the entry from the array
-			wikidata.Pages[i] = wikidata.Pages[len(wikidata.Pages)-1]
-			wikidata.Pages = wikidata.Pages[:len(wikidata.Pages)-1]
-			skipCount++
-			continue
-		}
-		i++
-	}
-
-	logger.Debug("Skipped %d pages\n", skipCount)
-}
-
-// parse the input XML file into a struct and create a cache file optionally
-func parseXML(makeCache bool, parseFile string, cacheFile string) *WikiData {
-	logger.Info("Opening xml file\n")
-	file, err := ioutil.ReadFile(parseFile)
-	check(err)
-
-	wikidata := &WikiData{}
-
-	start := time.Now()
-	logger.Info("Unmarshalling xml ... ")
-	err = xml.Unmarshal(file, wikidata)
-	end := time.Now()
-	logger.Printc(colorlog.Linfo, colorlog.Grey, "elapsed %s\n", end.Sub(start))
-	check(err)
-
-	logger.Info("Parsed %d pages\n", len(wikidata.Pages))
-
-	if makeCache {
-		err = encodeCache(wikidata, cacheFile)
-		check(err)
-	}
-
-	return wikidata
-}
-
-// encode the data into a binary cache file
-func encodeCache(data *WikiData, file string) error {
-	logger.Info("Creating binary cache: '%s'\n", file)
-	cacheFile, err := os.Create(file)
-	if err != nil {
-		return err
-	}
-
-	enc := gob.NewEncoder(cacheFile)
-
-	start := time.Now()
-	logger.Debug("Encoding data ... ")
-	enc.Encode(data)
-	end := time.Now()
-	logger.Printc(colorlog.Ldebug, colorlog.Green, "elapsed %s\n", end.Sub(start))
-
-	logger.Info("Binary cache built.\n")
-	cacheFile.Close()
-
-	return nil
-}
-
-// decode binary cache file into a usable struct
-func decodeCache(file string) (*WikiData, error) {
-	logger.Info("Initializing cached object\n")
-	cacheFile, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-
-	data := &WikiData{}
-	dec := gob.NewDecoder(cacheFile)
-
-	start := time.Now()
-	logger.Debug("Decoding data ... ")
-	dec.Decode(data)
-	end := time.Now()
-	logger.Printc(colorlog.Ldebug, colorlog.Green, "elapsed %s\n", end.Sub(start))
-
-	logger.Info("Cache initialized.\n")
-	cacheFile.Close()
-
-	return data, nil
-}
-
-// Helper functions
-func check(err error) {
-	if err != nil {
-		logger.Fatal("%s\n", err.Error())
-		panic(err)
-	}
-}
-
-func getSection(start int, end int, text []byte) []byte {
-	if end < 0 {
-		return text[start:]
-	}
-
-	return text[start:end]
-}
-
-func stringInSlice(str string, list []string) bool {
-	for _, lStr := range list {
-		if str == lStr {
-			return true
-		}
-	}
-	return false
-}
-
-// adjust the index offset to account for leading whitespace character
-func adjustIndexLW(index int, text []byte) int {
-	if text[index : index+1][0] == byte('\n') {
-		index++
-	}
-	return index
 }
