@@ -1,9 +1,44 @@
 package lib
 
-import "database/sql"
+import (
+	"database/sql"
+	"fmt"
+)
+
+func Init(db string) (dbh *sql.DB, err error) {
+	logger.Info("Opening database\n")
+	dbh, err = sql.Open("sqlite3", fmt.Sprintf("file:%s?cache=shared&mode=rwc&_mutex=full&_busy_timeout=500", db))
+	if err != nil {
+		return
+	}
+
+	dbh.SetMaxOpenConns(1)
+
+	sth, err := dbh.Prepare(`CREATE TABLE IF NOT EXISTS dictionary
+                             (
+                                 id INTEGER PRIMARY KEY,
+                                 word TEXT,
+                                 lexical_category TEXT,
+                                 etymology_no INTEGER,
+                                 definition_no INTEGER,
+                                 definition TEXT
+                             )`)
+	if err != nil {
+		return
+	}
+	sth.Exec()
+
+	sth, err = dbh.Prepare(`CREATE INDEX IF NOT EXISTS dict_word_idx
+                            ON dictionary (word, lexical_category, etymology_no, definition_no)`)
+	if err != nil {
+		return
+	}
+	sth.Exec()
+	return
+}
 
 func PerformInserts(dbh *sql.DB, inserts []*Insert) int {
-	ins_count := 0
+	insCount := 0
 	query := `INSERT INTO dictionary (word, lexical_category, etymology_no, definition_no, definition)
               VALUES (?, ?, ?, ?, ?)`
 
@@ -25,7 +60,7 @@ func PerformInserts(dbh *sql.DB, inserts []*Insert) int {
 					ins.Word, category, ins.Etymology, def_no, def)
 				_, err := sth.Exec(ins.Word, category, ins.Etymology, def_no, def)
 				Check(err)
-				ins_count++
+				insCount++
 			}
 		}
 	}
@@ -33,5 +68,5 @@ func PerformInserts(dbh *sql.DB, inserts []*Insert) int {
 	err = tx.Commit()
 	Check(err)
 
-	return ins_count
+	return insCount
 }
