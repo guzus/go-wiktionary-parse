@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"flag"
-	"fmt"
 	"go-wikitionary-parse/lib"
-	"go-wikitionary-parse/lib/wikitemplates"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,25 +15,6 @@ import (
 )
 
 var (
-	// regex pointers
-	wikiLang       *regexp.Regexp = regexp.MustCompile(`(\s==|^==)[\w\s]+==`)          // most languages are a single word; there are some that are multiple words
-	wikiLexM       *regexp.Regexp = regexp.MustCompile(`(\s====|^====)[\w\s]+====`)    // lexical category could be multi-word (e.g. "Proper Noun") match for multi-etymology
-	wikiLexS       *regexp.Regexp = regexp.MustCompile(`(\s===|^===)[\w\s]+===`)       // lexical category match for single etymology
-	wikiEtymologyS *regexp.Regexp = regexp.MustCompile(`(\s===|^===)Etymology===`)     // check for singular etymology
-	wikiEtymologyM *regexp.Regexp = regexp.MustCompile(`(\s===|^===)Etymology \d+===`) // these heading may or may not have a number designation
-	wikiNumListAny *regexp.Regexp = regexp.MustCompile(`\s##?[\*:]*? `)                // used to find all num list indices
-	wikiNumList    *regexp.Regexp = regexp.MustCompile(`\s#[^:*] `)                    // used to find the num list entries that are of concern
-	wikiGenHeading *regexp.Regexp = regexp.MustCompile(`(\s=+|^=+)[\w\s]+`)            // generic heading search
-	wikiNewLine    *regexp.Regexp = regexp.MustCompile(`\n`)
-	wikiBracket    *regexp.Regexp = regexp.MustCompile(`[\[\]]+`)
-	wikiWordAlt    *regexp.Regexp = regexp.MustCompile(`\[\[([\w\s]+)\|[\w\s]+\]\]`)
-	wikiModifier   *regexp.Regexp = regexp.MustCompile(`\{\{m\|\w+\|([\w\s]+)\}\}`)
-	wikiLabel      *regexp.Regexp = regexp.MustCompile(`\{\{(la?b?e?l?)\|\w+\|([\w\s\|'",;\(\)_\[\]-]+)\}\}`)
-	wikiTplt       *regexp.Regexp = regexp.MustCompile(`\{\{|\}\}`) // open close template bounds "{{ ... }}"
-	wikiExample    *regexp.Regexp = regexp.MustCompile(`\{\{examples(.+)\}\}`)
-	//wikiRefs       *regexp.Regexp = regexp.MustCompile(`\<ref\>(.*?)\</ref\>`)
-	htmlBreak *regexp.Regexp = regexp.MustCompile(`\<br\>`)
-
 	// other stuff
 	language        string             = ""
 	logger          *colorlog.ColorLog = &colorlog.ColorLog{}
@@ -153,46 +130,46 @@ func pageWorker(id int, wg *sync.WaitGroup, pages []lib.Page, dbh *sql.DB) {
 		text := []byte(page.Revisions[0].Text)
 		logger.Debug("Raw size: %d\n", len(text))
 
-		text = wikiModifier.ReplaceAll(text, []byte("'$1'"))
+		text = lib.WikiModifier.ReplaceAll(text, []byte("'$1'"))
 		logger.Debug("Modifier size: %d\n", len(text))
 
 		//text = wikiLabel.ReplaceAll(text, []byte("(${2})"))
 		//logger.Debug("Label size: %d\n", len(text))
 
-		text = wikiExample.ReplaceAll(text, []byte(""))
+		text = lib.WikiExample.ReplaceAll(text, []byte(""))
 		logger.Debug("Example size: %d\n", len(text))
 
-		text = wikiWordAlt.ReplaceAll(text, []byte("$1"))
+		text = lib.WikiWordAlt.ReplaceAll(text, []byte("$1"))
 		logger.Debug("WordAlt size: %d\n", len(text))
 
-		text = wikiBracket.ReplaceAll(text, []byte(""))
+		text = lib.WikiBracket.ReplaceAll(text, []byte(""))
 		logger.Debug("Bracket size: %d\n", len(text))
 
-		text = htmlBreak.ReplaceAll(text, []byte(" "))
+		text = lib.HtmlBreak.ReplaceAll(text, []byte(" "))
 		logger.Debug("Html Break size: %d\n", len(text))
 
 		textSize := len(text)
 		logger.Debug("Starting Size of corpus: %d bytes\n", textSize)
 
 		// get language section of the page
-		text = getLanguageSection(text)
+		text = lib.GetLanguageSection(text, language)
 		logger.Debug("Reduced corpus by %d bytes to %d\n", textSize-len(text), len(text))
 
 		// get all indices of the etymology headings
-		etymologyIdx := wikiEtymologyM.FindAllIndex(text, -1)
+		etymologyIdx := lib.WikiEtymologyM.FindAllIndex(text, -1)
 		if len(etymologyIdx) == 0 {
 			logger.Debug("Did not find multi-style etymology. Checking for singular ...\n")
-			etymologyIdx = wikiEtymologyS.FindAllIndex(text, -1)
+			etymologyIdx = lib.WikiEtymologyS.FindAllIndex(text, -1)
 		}
 		/*
-		   When there is only a single or no etymology, then lexical catetories are of the form ===[\w\s]+===
-		   Otherwise, then lexical catigories are of the form ====[\w\s]+====
+		   When there is only a single or no etymology, then lexical categories are of the form ===[\w\s]+===
+		   Otherwise, then lexical categories are of the form ====[\w\s]+====
 		*/
 		logger.Debug("Found %d etymologies\n", len(etymologyIdx))
 		if len(etymologyIdx) <= 1 {
 			// need to get the lexical category via regexp
 			logger.Debug("Parsing by lexical category\n")
-			lexcatIdx := wikiLexS.FindAllIndex(text, -1)
+			lexcatIdx := lib.WikiLexS.FindAllIndex(text, -1)
 			inserts = append(inserts, parseByLexicalCategory(word, lexcatIdx, text)...)
 		} else {
 			logger.Debug("Parsing by etymologies\n")
@@ -202,7 +179,7 @@ func pageWorker(id int, wg *sync.WaitGroup, pages []lib.Page, dbh *sql.DB) {
 
 	// perform inserts
 	inserted := lib.PerformInserts(dbh, inserts)
-	logger.Info("[%2d] Inserted %6d records for %6d pages\n", id, inserted, len(pages))
+	logger.Info("[Worker %2d] Inserted %6d records for %6d pages\n", id, inserted, len(pages))
 }
 
 func parseByEtymologies(word string, etList [][]int, text []byte) []*lib.Insert {
@@ -219,7 +196,7 @@ func parseByEtymologies(word string, etList [][]int, text []byte) []*lib.Insert 
 
 		logger.Debug("parseByEtymologies> Section is %d bytes\n", len(section))
 
-		lexcatIdx := wikiLexM.FindAllIndex(section, -1)
+		lexcatIdx := lib.WikiLexM.FindAllIndex(section, -1)
 		lexcatIdxSize := len(lexcatIdx)
 
 		var definitions []string
@@ -233,17 +210,17 @@ func parseByEtymologies(word string, etList [][]int, text []byte) []*lib.Insert 
 				continue
 			}
 
-			nHeading := wikiGenHeading.FindIndex(section[lexcatIdx[j][1]:])
+			nHeading := lib.WikiGenHeading.FindIndex(section[lexcatIdx[j][1]:])
 			if len(nHeading) > 0 {
 				nHeading[0] = nHeading[0] + lexcatIdx[j][1]
 				nHeading[1] = nHeading[1] + lexcatIdx[j][1]
 				logger.Debug("parseByLemmas> LEM_LIST %d: %+v NHEADING: %+v\n", j, lexcatIdx[j], nHeading)
-				definitions = getDefinitions(lexcatIdx[j][1], nHeading[0], section)
+				definitions = lib.GetDefinitions(lexcatIdx[j][1], nHeading[0], section)
 			} else if j+1 >= lexcatIdxSize {
-				definitions = getDefinitions(lexcatIdx[j][1], -1, section)
+				definitions = lib.GetDefinitions(lexcatIdx[j][1], -1, section)
 			} else {
 				jth1Idx := lib.AdjustIndexLW(lexcatIdx[j+1][0], section)
-				definitions = getDefinitions(lexcatIdx[j][1], jth1Idx, section)
+				definitions = lib.GetDefinitions(lexcatIdx[j][1], jth1Idx, section)
 			}
 			logger.Debug("parseByEtymologies> Definitions: " + strings.Join(definitions, ", ") + "\n")
 			ins.CatDefs[lexcat] = definitions
@@ -274,11 +251,11 @@ func parseByLexicalCategory(word string, lexList [][]int, text []byte) []*lib.In
 
 		definitions := []string{}
 		if i+1 >= lexSize {
-			definitions = getDefinitions(lexList[i][1], -1, text)
+			definitions = lib.GetDefinitions(lexList[i][1], -1, text)
 		} else {
 			ith1Idx := lib.AdjustIndexLW(lexList[i+1][0], text)
 			logger.Debug("parseByLexicalCategory> LEMMA: %s\n", string(text[lexList[i][1]:ith1Idx]))
-			definitions = getDefinitions(lexList[i][1], ith1Idx, text)
+			definitions = lib.GetDefinitions(lexList[i][1], ith1Idx, text)
 		}
 
 		logger.Debug("parseByLexicalCategory> Found %d definitions\n", len(definitions))
@@ -288,126 +265,4 @@ func parseByLexicalCategory(word string, lexList [][]int, text []byte) []*lib.In
 	}
 
 	return inserts
-}
-
-func getTranslations(start int, end int, text []byte) []string {
-	return []string{}
-}
-
-func getDefinitions(start int, end int, text []byte) []string {
-	var category []byte
-	var defs []string
-
-	if end < 0 {
-		category = text[start:]
-	} else {
-		category = text[start:end]
-	}
-
-	logger.Debug("getDefinitions> TEXT: %s\n", string(text))
-	nHeading := wikiGenHeading.FindIndex(text[start:])
-	logger.Debug("getDefinitions> START: %d END: %d NHEADING: %+v\n", start, end, nHeading)
-	if len(nHeading) > 0 && nHeading[1]+start < end {
-		nHeading[0], nHeading[1] = nHeading[0]+start, nHeading[1]+start
-		category = text[start:nHeading[0]]
-	}
-
-	nlIndices := wikiNumListAny.FindAllIndex(category, -1)
-	logger.Debug("getDefinitions> Found %d NumList entries\n", len(nlIndices))
-	nlIndicesSize := len(nlIndices)
-	for i := 0; i < nlIndicesSize; i++ {
-		ithIdx := lib.AdjustIndexLW(nlIndices[i][0], category)
-		if string(category[ithIdx:nlIndices[i][1]]) != "# " {
-			logger.Debug("getDefinitions> Got quotation or annotation bullet. Skipping...\n")
-			continue
-		}
-
-		if i+1 >= nlIndicesSize && string(category[ithIdx:nlIndices[i][1]]) == "# " {
-			def := parseDefinition(nlIndices[i][1], len(category), category)
-			logger.Debug("getDefinitions> [%0d] Appending %s to the definition list\n", i, string(def))
-			defs = append(defs, string(def))
-		}
-
-		if i+1 < nlIndicesSize && string(category[ithIdx:nlIndices[i][1]]) == "# " {
-			ith1Idx := lib.AdjustIndexLW(nlIndices[i+1][0], category)
-			def := parseDefinition(nlIndices[i][1], ith1Idx, category)
-			logger.Debug("getDefinitions> [%0d] Appending %s to the definition list\n", i, string(def))
-			defs = append(defs, string(def))
-		}
-	}
-
-	logger.Debug("getDefinitions> Got %d definitions\n", len(defs))
-	return defs
-}
-
-func parseDefinition(start int, end int, text []byte) []byte {
-	def := text[start:end]
-	//def = wikiNewLine.ReplaceAll(def, []byte(" "))
-
-	// need to parse the templates in the definition
-	sDef, err := wikitemplates.ParseRecursive(def)
-	lib.Check(err)
-
-	def = []byte(sDef)
-	newline := wikiNewLine.FindIndex(def)
-
-	if len(newline) > 0 {
-		def = def[:newline[0]]
-	}
-
-	def = bytes.TrimSpace(def)
-
-	return def
-}
-
-func getLanguageSection(text []byte) []byte {
-	// this is going to pull out the "section" of the text bounded by the
-	// desired language heading and the following heading or the end of
-	// the data.
-
-	indices := wikiLang.FindAllIndex(text, -1)
-	indicesSize := len(indices)
-
-	logger.Debug("CORPUS: %s\n", string(text))
-	logger.Debug("CORPUS SIZE: %d INDICES_SIZE: %d INDICES: %+v\n", len(text), indicesSize, indices)
-
-	if indicesSize == 0 {
-		return text
-	}
-
-	// when the match has a leading \s, remove it
-	if text[indices[0][0] : indices[0][0]+1][0] == byte('\n') {
-		indices[0][0]++
-	}
-
-	if indicesSize == 1 {
-		// it is assumed at this point that the pages have been filterd by the
-		// desired language already, which means that the only heading present
-		// is the one that is wanted.
-		logger.Debug("Found only 1 heading. Returning corpus for heading '%s'\n", string(text[indices[0][0]:indices[0][1]]))
-		return text[indices[0][1]:]
-	}
-
-	logger.Debug("Found %d indices\n", indicesSize)
-	logger.Debug("Indices: %v\n", indices)
-	corpus := text
-	for i := 0; i < indicesSize; i++ {
-		heading := string(text[indices[i][0]:indices[i][1]])
-		logger.Debug("Checking heading: %s\n", heading)
-
-		if heading != fmt.Sprintf("==%s==", language) {
-			logger.Debug("'%s' != '==%s=='\n", heading, language)
-			continue
-		}
-
-		if i == indicesSize-1 {
-			logger.Debug("Found last heading\n")
-			return text[indices[i][1]:]
-		}
-
-		corpus = text[indices[i][1]:indices[i+1][0]]
-		break
-	}
-
-	return corpus
 }
