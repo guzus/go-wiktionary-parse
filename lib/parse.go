@@ -7,6 +7,8 @@ import (
 )
 
 func getTranslations(start int, end int, text []byte) []string {
+	// need to parse =====Translations===== section
+
 	return []string{}
 }
 

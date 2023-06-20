@@ -249,7 +249,7 @@ func parseByLexicalCategory(word string, lexList [][]int, text []byte) []*lib.In
 			continue
 		}
 
-		definitions := []string{}
+		var definitions []string
 		if i+1 >= lexSize {
 			definitions = lib.GetDefinitions(lexList[i][1], -1, text)
 		} else {
